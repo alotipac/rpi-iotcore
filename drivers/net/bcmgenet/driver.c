@@ -1,8 +1,8 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include <ntintsafe.h>
-#include <preview/netadaptercx.h>
-#include <preview/netadapter.h>
+#include <netadaptercx.h>
+#include <netadapter.h>
 #include <evntrace.h>
 #include <TraceLoggingProvider.h>
 #include <net/logicaladdress.h>
@@ -105,7 +105,7 @@ typedef struct GenetAdapter {
     NET_ADAPTER_LINK_LAYER_ADDRESS permanentMacAddress;
     NET_ADAPTER_LINK_LAYER_ADDRESS currentMacAddress;
     NET_PACKET_FILTER_FLAGS packetFilter;
-    ULONG numMulticastAddresses;
+    SIZE_T numMulticastAddresses;
     NET_ADAPTER_LINK_LAYER_ADDRESS
     multicastAddresses[GENET_MAX_MULTICAST_ADDRESSES];
 } GenetAdapter;
@@ -423,7 +423,7 @@ static void GenetSetMacAddressFilters(GenetAdapter *adapter) {
     ULONG umacCmd;
     ULONG mdfCtrl = 0;
     ULONG curFilter = 0;
-    ULONG curMulticast;
+    SIZE_T curMulticast;
 
     umacCmd = GRD(adapter, UMAC.Cmd);
     if (adapter->packetFilter &
@@ -483,24 +483,20 @@ static void GenetFillRxDesc(GenetAdapter *adapter, ULONG desc) {
     rxQueue->descBuffers[desc] = rxBuffer;
 }
 
-static void GenetSetPacketFilter(NETADAPTER netAdapter,
-                                 NET_PACKET_FILTER_FLAGS packetFilter) {
+static void GenetSetReceiveFilter(NETADAPTER netAdapter,
+                                  NETRECEIVEFILTER netReceiveFilter) {
     GenetAdapter *adapter = GenetGetAdapterContext(netAdapter);
+    NET_PACKET_FILTER_FLAGS packetFilter =
+        NetReceiveFilterGetPacketFilter(netReceiveFilter);
+    SIZE_T multicastAddressCount =
+        NetReceiveFilterGetMulticastAddressCount(netReceiveFilter);
+    NET_ADAPTER_LINK_LAYER_ADDRESS const *multicastAddressList =
+        NetReceiveFilterGetMulticastAddressList(netReceiveFilter);
 
-    TraceInfo("Entry", TraceULX((ULONG)packetFilter, "PacketFilter"));
+    TraceInfo("Entry", TraceULX((ULONG)packetFilter, "PacketFilter"),
+              TraceUQX(multicastAddressCount, "MulticastAddresses"));
     WdfSpinLockAcquire(adapter->lock);
     adapter->packetFilter = packetFilter;
-    GenetSetMacAddressFilters(adapter);
-    WdfSpinLockRelease(adapter->lock);
-}
-
-static void GenetSetMulticastList(
-    NETADAPTER netAdapter, ULONG multicastAddressCount,
-    NET_ADAPTER_LINK_LAYER_ADDRESS *multicastAddressList) {
-    GenetAdapter *adapter = GenetGetAdapterContext(netAdapter);
-
-    TraceInfo("Entry", TraceULX(multicastAddressCount, "Count"));
-    WdfSpinLockAcquire(adapter->lock);
     adapter->numMulticastAddresses = multicastAddressCount;
     RtlZeroMemory(
         adapter->multicastAddresses,
@@ -521,8 +517,7 @@ static NTSTATUS GenetAdapterStart(GenetAdapter *adapter) {
     NET_ADAPTER_DMA_CAPABILITIES dmaCapabilities;
     NET_ADAPTER_TX_CAPABILITIES txCapabilities;
     NET_ADAPTER_RX_CAPABILITIES rxCapabilities;
-    NET_ADAPTER_PACKET_FILTER_CAPABILITIES packetFilterCapabilities;
-    NET_ADAPTER_MULTICAST_CAPABILITIES multicastCapabilities;
+    NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES receiveFilterCapabilities;
 
     NET_ADAPTER_LINK_STATE_INIT_DISCONNECTED(&linkState);
     NetAdapterSetLinkState(adapter->netAdapter, &linkState);
@@ -543,17 +538,13 @@ static NTSTATUS GenetAdapterStart(GenetAdapter *adapter) {
     NetAdapterSetDataPathCapabilities(adapter->netAdapter, &txCapabilities,
                                       &rxCapabilities);
 
-    NET_ADAPTER_PACKET_FILTER_CAPABILITIES_INIT(&packetFilterCapabilities,
-                                                GENET_SUPPORTED_FILTERS,
-                                                GenetSetPacketFilter);
-    NetAdapterSetPacketFilterCapabilities(adapter->netAdapter,
-                                          &packetFilterCapabilities);
-
-    NET_ADAPTER_MULTICAST_CAPABILITIES_INIT(&multicastCapabilities,
-                                            GENET_MAX_MULTICAST_ADDRESSES,
-                                            GenetSetMulticastList);
-    NetAdapterSetMulticastCapabilities(adapter->netAdapter,
-                                       &multicastCapabilities);
+    NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES_INIT(&receiveFilterCapabilities,
+                                                 GenetSetReceiveFilter);
+    receiveFilterCapabilities.SupportedPacketFilters = GENET_SUPPORTED_FILTERS;
+    receiveFilterCapabilities.MaximumMulticastAddresses =
+        GENET_MAX_MULTICAST_ADDRESSES;
+    NetAdapterSetReceiveFilterCapabilities(adapter->netAdapter,
+                                           &receiveFilterCapabilities);
 
     status = NetAdapterStart(adapter->netAdapter);
 
