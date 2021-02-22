@@ -59,6 +59,7 @@ typedef struct GenetTxQueue {
     ULONG prodIndex;
     ULONG consIndex;
     GENET_RX_BUFFER_MDL mdl;
+    BOOLEAN notificationEnabled;
 } GenetTxQueue;
 
 typedef struct GenetRxQueue {
@@ -77,13 +78,12 @@ typedef struct GenetRxQueue {
     ULONG prodIndex;
     ULONG consIndex;
     BOOLEAN canceled;
+    BOOLEAN notificationEnabled;
 } GenetRxQueue;
 
 typedef struct GenetInterrupt {
     GenetAdapter *adapter;
     WDFINTERRUPT wdfInterrupt;
-    LONG txNotify;
-    LONG rxNotify;
     ULONG savedStatus;
 } GenetInterrupt;
 
@@ -559,39 +559,34 @@ static NTSTATUS GenetAdapterStart(GenetAdapter *adapter) {
     return status;
 }
 
-static void GenetInterruptSetCommon(GenetAdapter *adapter, LONG *notify,
-                                    BOOLEAN enabled) {
+static void GenetInterruptSetCommon(GenetAdapter *adapter) {
     const ULONG interruptMask = BG_INTR_TXDMA_DONE | BG_INTR_RXDMA_DONE;
     ULONG armedInterrupts = 0;
 
-    InterlockedExchange(notify, enabled);
-
-    WdfInterruptAcquireLock(adapter->interrupt->wdfInterrupt);
-
-    if (adapter->interrupt->txNotify) {
+    if (adapter->txQueue->notificationEnabled) {
         armedInterrupts |= BG_INTR_TXDMA_DONE;
     }
 
-    if (adapter->interrupt->rxNotify) {
+    if (adapter->rxQueue->notificationEnabled) {
         armedInterrupts |= BG_INTR_RXDMA_DONE;
     }
 
+    WdfInterruptAcquireLock(adapter->interrupt->wdfInterrupt);
     GWR(adapter, INTRL2_0.CPU_Mask_Set, interruptMask & ~armedInterrupts);
     GWR(adapter, INTRL2_0.CPU_Mask_Clear, armedInterrupts);
-
     WdfInterruptReleaseLock(adapter->interrupt->wdfInterrupt);
-
-    if (!enabled) {
-        KeFlushQueuedDpcs();
-    }
 }
 
-static void GenetTxInterruptSet(GenetAdapter *adapter, BOOLEAN enabled) {
-    GenetInterruptSetCommon(adapter, &adapter->interrupt->txNotify, enabled);
+static void GenetTxInterruptSetLocked(GenetAdapter *adapter,
+                                      BOOLEAN notificationEnabled) {
+    adapter->txQueue->notificationEnabled = notificationEnabled;
+    GenetInterruptSetCommon(adapter);
 }
 
-static void GenetRxInterruptSet(GenetAdapter *adapter, BOOLEAN enabled) {
-    GenetInterruptSetCommon(adapter, &adapter->interrupt->rxNotify, enabled);
+static void GenetRxInterruptSetLocked(GenetAdapter *adapter,
+                                      BOOLEAN notificationEnabled) {
+    adapter->rxQueue->notificationEnabled = notificationEnabled;
+    GenetInterruptSetCommon(adapter);
 }
 
 static void GenetTxQueueAdvance(NETPACKETQUEUE netTxQueue) {
@@ -710,7 +705,7 @@ static void GenetTxQueueSetNotificationEnabled(NETPACKETQUEUE netTxQueue,
     GenetAdapter *adapter = GenetGetTxQueueContext(netTxQueue)->adapter;
 
     WdfSpinLockAcquire(adapter->lock);
-    GenetTxInterruptSet(adapter, notificationEnabled);
+    GenetTxInterruptSetLocked(adapter, notificationEnabled);
     WdfSpinLockRelease(adapter->lock);
 }
 
@@ -779,7 +774,7 @@ static void GenetTxQueueStop(NETPACKETQUEUE netTxQueue) {
     regData &= ~BG_UMAC_CMD_TX_EN;
     GWR(adapter, UMAC.Cmd, regData);
 
-    GenetTxInterruptSet(adapter, FALSE);
+    GenetTxInterruptSetLocked(adapter, FALSE);
     WdfSpinLockRelease(adapter->lock);
 }
 
@@ -874,7 +869,7 @@ static void GenetRxQueueSetNotificationEnabled(NETPACKETQUEUE netRxQueue,
     GenetAdapter *adapter = GenetGetRxQueueContext(netRxQueue)->adapter;
 
     WdfSpinLockAcquire(adapter->lock);
-    GenetRxInterruptSet(adapter, notificationEnabled);
+    GenetRxInterruptSetLocked(adapter, notificationEnabled);
     WdfSpinLockRelease(adapter->lock);
 }
 
@@ -953,7 +948,7 @@ static void GenetRxQueueStop(NETPACKETQUEUE netRxQueue) {
     TraceInfo("Entry", TraceULX(rxQueue->curFreeBuffer, "FreeBuffer"),
               TraceULX(rxQueue->numBuffers, "NumBuffers"));
     WdfSpinLockAcquire(adapter->lock);
-    GenetRxInterruptSet(adapter, FALSE);
+    GenetRxInterruptSetLocked(adapter, FALSE);
     WdfSpinLockRelease(adapter->lock);
 
     for (curDesc = 0; curDesc < rxQueue->numDescs; ++curDesc) {
@@ -976,7 +971,6 @@ static BOOLEAN GenetInterruptIsr(WDFINTERRUPT wdfInterrupt, ULONG messageId) {
     intrStatus = GRD(adapter, INTRL2_0.CPU_Status);
     intrStatus &= ~GRD(adapter, INTRL2_0.CPU_Mask_Status);
     GWR(adapter, INTRL2_0.CPU_Clear, intrStatus);
-    GWR(adapter, INTRL2_0.CPU_Mask_Set, intrStatus);
 
     InterlockedOr((LONG volatile *)&interrupt->savedStatus, intrStatus);
 
@@ -991,21 +985,31 @@ static void GenetInterruptDpc(WDFINTERRUPT wdfInterrupt,
     GenetAdapter *adapter = interrupt->adapter;
     ULONG intrStatus =
         InterlockedExchange((LONG volatile *)&interrupt->savedStatus, 0);
+    BOOLEAN txNotify = FALSE;
+    BOOLEAN rxNotify = FALSE;
 
     UNREFERENCED_PARAMETER(associatedObject);
 
-    if (intrStatus & BG_INTR_TXDMA_DONE) {
-        if (InterlockedExchange(&interrupt->txNotify, FALSE)) {
-            NetTxQueueNotifyMoreCompletedPacketsAvailable(
-                adapter->txQueue->netTxQueue);
-        }
+    WdfSpinLockAcquire(adapter->lock);
+    if (intrStatus & BG_INTR_TXDMA_DONE &&
+        adapter->txQueue->notificationEnabled) {
+        txNotify = TRUE;
     }
 
-    if (intrStatus & BG_INTR_RXDMA_DONE) {
-        if (InterlockedExchange(&interrupt->rxNotify, FALSE)) {
-            NetRxQueueNotifyMoreReceivedPacketsAvailable(
-                adapter->rxQueue->netRxQueue);
-        }
+    if (intrStatus & BG_INTR_RXDMA_DONE &&
+        adapter->rxQueue->notificationEnabled) {
+        rxNotify = TRUE;
+    }
+    WdfSpinLockRelease(adapter->lock);
+
+    if (txNotify) {
+        NetTxQueueNotifyMoreCompletedPacketsAvailable(
+            adapter->txQueue->netTxQueue);
+    }
+
+    if (rxNotify) {
+        NetRxQueueNotifyMoreReceivedPacketsAvailable(
+            adapter->rxQueue->netRxQueue);
     }
 }
 
