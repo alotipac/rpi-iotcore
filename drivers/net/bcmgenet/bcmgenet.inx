@@ -61,6 +61,7 @@ AddReg                  = BCMGENET.Service.AddReg
 
 [BCMGENET.Service.AddReg]
 HKR, , BootFlags, 0x10001, 1
+HKR, Parameters, AllowDmaHalBypass, 0x00010001, 1
 
 [NetworkAddress.Kw.AddReg]
 HKR,Ndi\params\NetworkAddress, ParamDesc, 0, %NetworkAddress%

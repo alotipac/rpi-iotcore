@@ -58,6 +58,7 @@ typedef struct GenetTxQueue {
     GenetTxPacket *packetContexts;
     ULONG prodIndex;
     ULONG consIndex;
+    GENET_RX_BUFFER_MDL mdl;
 } GenetTxQueue;
 
 typedef struct GenetRxQueue {
@@ -108,6 +109,8 @@ typedef struct GenetAdapter {
     SIZE_T numMulticastAddresses;
     NET_ADAPTER_LINK_LAYER_ADDRESS
     multicastAddresses[GENET_MAX_MULTICAST_ADDRESSES];
+    DMA_OPERATIONS txDmaOperations;
+    PGET_DMA_ADAPTER_INFO txOrigGetDmaAdapterInfo;
 } GenetAdapter;
 
 typedef struct GenetDevice {
@@ -597,6 +600,7 @@ static void GenetTxQueueAdvance(NETPACKETQUEUE netTxQueue) {
     NET_RING *packetRing = NetRingCollectionGetPacketRing(txQueue->rings);
     NET_RING *fragmentRing = NetRingCollectionGetFragmentRing(txQueue->rings);
     BOOLEAN postedDescs = FALSE;
+    MDL *mdl = &txQueue->mdl.mdl;
     ULONG prodDesc;
     ULONG consDesc;
     ULONG hwDescs;
@@ -611,6 +615,7 @@ static void GenetTxQueueAdvance(NETPACKETQUEUE netTxQueue) {
     ULONG length_status;
     const NET_FRAGMENT_LOGICAL_ADDRESS *logicalAddress;
     UINT64 fragmentAddress;
+    const NET_FRAGMENT_VIRTUAL_ADDRESS *virtualAddress;
 
     prodDesc = txQueue->prodIndex % txQueue->numDescs;
     consDesc = txQueue->consIndex % txQueue->numDescs;
@@ -632,6 +637,8 @@ static void GenetTxQueueAdvance(NETPACKETQUEUE netTxQueue) {
                 postedDescs = TRUE;
                 fragment =
                     NetRingGetFragmentAtIndex(fragmentRing, fragmentIndex);
+                NT_FRE_ASSERT(fragment->Offset + fragment->ValidLength <
+                              GENET_RX_BUFFER_SIZE);
                 length_status = (((USHORT)fragment->ValidLength)
                                  << BG_DMA_BD_LENGTH_SHIFT) |
                                 BG_DMA_BG_STATUS_TX_QTAG;
@@ -646,6 +653,12 @@ static void GenetTxQueueAdvance(NETPACKETQUEUE netTxQueue) {
                     &txQueue->logicalAddressExtension, fragmentIndex);
                 fragmentAddress =
                     logicalAddress->LogicalAddress + fragment->Offset;
+                virtualAddress = NetExtensionGetFragmentVirtualAddress(
+                    &txQueue->virtualAddressExtension, fragmentIndex);
+                MmInitializeMdl(mdl, virtualAddress->VirtualAddress,
+                                fragment->Offset + fragment->ValidLength);
+                MmBuildMdlForNonPagedPool(mdl);
+                KeFlushIoBuffers(mdl, FALSE, TRUE);
                 GWR(adapter, TDMA.BDs[prodDesc].Length_Status, length_status);
                 GWR(adapter, TDMA.BDs[prodDesc].Address_Lo,
                     (ULONG)fragmentAddress);
@@ -1376,6 +1389,20 @@ static void GenetTimerFunc(WDFTIMER wdfTimer) {
     NetAdapterSetLinkState(adapter->netAdapter, &linkState);
 }
 
+static NTSTATUS GenetTxGetDmaAdapterInfo(DMA_ADAPTER *dmaAdapter,
+                                         DMA_ADAPTER_INFO *adapterInfo) {
+    GenetAdapter *adapter = CONTAINING_RECORD(dmaAdapter->DmaOperations,
+                                              GenetAdapter, txDmaOperations);
+    NTSTATUS status = adapter->txOrigGetDmaAdapterInfo(dmaAdapter, adapterInfo);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    adapterInfo->V1.Flags |= ADAPTER_INFO_API_BYPASS;
+
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS GenetDeviceAdd(WDFDRIVER driver,
                                struct WDFDEVICE_INIT *deviceInit) {
     NTSTATUS status;
@@ -1390,6 +1417,7 @@ static NTSTATUS GenetDeviceAdd(WDFDRIVER driver,
     NETADAPTER netAdapter;
     GenetDevice *device;
     GenetAdapter *adapter;
+    DMA_ADAPTER *txDmaAdapter;
     WDF_OBJECT_ATTRIBUTES lockAttributes;
     WDF_OBJECT_ATTRIBUTES timerAttributes;
     WDF_TIMER_CONFIG timerConfig;
@@ -1445,6 +1473,14 @@ static NTSTATUS GenetDeviceAdd(WDFDRIVER driver,
     adapter->wdfDevice = wdfDevice;
     adapter->netAdapter = netAdapter;
     adapter->dmaEnabler = dmaEnabler;
+    txDmaAdapter =
+        WdfDmaEnablerWdmGetDmaAdapter(dmaEnabler, WdfDmaDirectionWriteToDevice);
+    RtlCopyMemory(&adapter->txDmaOperations, txDmaAdapter->DmaOperations,
+                  sizeof(adapter->txDmaOperations));
+    adapter->txOrigGetDmaAdapterInfo =
+        adapter->txDmaOperations.GetDmaAdapterInfo;
+    adapter->txDmaOperations.GetDmaAdapterInfo = GenetTxGetDmaAdapterInfo;
+    txDmaAdapter->DmaOperations = &adapter->txDmaOperations;
 
     status = NetAdapterOpenConfiguration(netAdapter, WDF_NO_OBJECT_ATTRIBUTES,
                                          &adapter->netConfiguration);
